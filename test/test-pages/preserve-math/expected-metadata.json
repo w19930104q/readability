@@ -1,0 +1,10 @@
+{
+  "title": "Preserving mathematical formulas in Reader View",
+  "byline": null,
+  "dir": null,
+  "lang": "en",
+  "excerpt": "This article explains several formulas. A native inline MathML expression\n                \n                    \n                        x\n                        2\n                    \n                \n                appears inside running text, while a block-level expression with a TeX\n                annotation follows on its own line:",
+  "siteName": null,
+  "publishedTime": null,
+  "readerable": true
+}

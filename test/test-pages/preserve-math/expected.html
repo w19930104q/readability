@@ -1,0 +1,38 @@
+<div id="readability-page-1" class="page">
+    <article>
+        <p> This article explains several formulas. A native inline MathML expression <math alttext="x squared" data-readability-math="mathml">
+                <msup>
+                    <mi>x</mi>
+                    <mn>2</mn>
+                </msup>
+            </math> appears inside running text, while a block-level expression with a TeX annotation follows on its own line: </p>
+        <math display="block" data-readability-math="mathml">
+            <semantics>
+                <mfrac>
+                    <mn>1</mn>
+                    <mn>2</mn>
+                </mfrac>
+            </semantics>
+        </math>
+        <p> MathJax stores inline TeX in a script tag <code data-readability-math="tex">E=mc^2</code> and display TeX in a script tag with an explicit mode:
+        <pre data-readability-math="tex">\int_{0}^{1} x\,dx</pre> Both have to survive as inert text rather than executable scripts. </p>
+        <p> KaTeX emits two parallel layers, an accessible MathML layer and an aria-hidden visual approximation. The inline marker <math data-readability-math="mathml">
+                <semantics>
+                    <mrow>
+                        <mi>a</mi>
+                        <mo>+</mo>
+                        <mi>b</mi>
+                    </mrow>
+                </semantics>
+            </math> is followed by a display marker: <math display="block" data-readability-math="mathml">
+                <mrow>
+                    <mi>y</mi>
+                    <mo>=</mo>
+                    <mn>3</mn>
+                </mrow>
+            </math>
+        </p>
+        <p> Hostile TeX must stay inert text and must never execute or create a script, image or other element. The payload uses a javascript URL and TeX control sequences, all of which have to remain literal text: <code data-readability-math="tex">\href{javascript:alert(1)}{\texttt{x}} \frac{1}{2}</code> whereas an ordinary script and its are removed like on any other page. </p>
+        <p> Enough surrounding prose to make this document comfortably exceed the character threshold so the article is selected as the main content. The quick brown fox jumps over the lazy dog while the formulas above are preserved in their original order and with their inline versus block semantics intact. </p>
+    </article>
+</div>

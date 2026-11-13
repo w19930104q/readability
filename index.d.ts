@@ -75,6 +75,20 @@ export interface ReadabilityOptions<T = string> {
    * Defaults to 1.
    */
   linkDensityModifier?: number;
+  /**
+   * Whether to preserve mathematical formulas found in the article.
+   * Defaults to `false`.
+   *
+   * When enabled, native MathML (`<math>`) elements are normalized and kept,
+   * KaTeX two-layer markup is reduced to its MathML layer (the aria-hidden
+   * visual copy is removed), and MathJax `math/tex` script tags are converted
+   * into inert `<code>`/`<pre>` elements carrying the raw TeX as text. No
+   * script is executed and no rendering service is requested. Formulas keep
+   * their original position and inline/block semantics, each contributes its
+   * text exactly once to `textContent`, and formulas outside the selected
+   * article are not restored.
+   */
+  preserveMath?: boolean;
 }
 
 export class Readability<T = string> {

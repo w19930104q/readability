@@ -44,7 +44,10 @@
   };
 
   function encodeTextContentHTML(s) {
-    return s.replace(/[&<>]/g, function (x) {
+    // Text nodes are serialized into element innerHTML, where an unescaped
+    // quote would break any attribute a downstream parser reconstructs, so
+    // encode the same set of characters as encodeHTML rather than just &<>.
+    return s.replace(/[&<>'"]/g, function (x) {
       return reverseEntityTable[x];
     });
   }

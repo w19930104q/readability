@@ -64,6 +64,7 @@ function Readability(doc, options) {
   this._disableJSONLD = !!options.disableJSONLD;
   this._allowedVideoRegex = options.allowedVideoRegex || this.REGEXPS.videos;
   this._linkDensityModifier = options.linkDensityModifier || 0;
+  this._preserveMath = !!options.preserveMath;
 
   // Start with all flags set
   this._flags =
@@ -264,6 +265,15 @@ Readability.prototype = {
   // These are the classes that readability sets itself.
   CLASSES_TO_PRESERVE: ["page"],
 
+  // The attribute put on the inert elements that replace MathJax <script
+  // type="math/tex"> tags, and on every <math> element we keep, so that the
+  // text content computation can treat each formula as a single token.
+  MATH_MARKER_ATTR: "data-readability-math",
+
+  // The base <script type> MathJax uses for inline TeX; display TeX is the
+  // same MIME type with a "; mode=display" parameter.
+  MATH_TEX_INLINE_TYPE: "math/tex",
+
   // These are the list of HTML entities that need to be escaped.
   HTML_ESCAPE_MAP: {
     lt: "<",
@@ -285,10 +295,260 @@ Readability.prototype = {
 
     this._simplifyNestedElements(articleContent);
 
+    if (this._preserveMath) {
+      this._processMathInContent(articleContent);
+    }
+
     if (!this._keepClasses) {
       // Remove classes.
       this._cleanClasses(articleContent);
     }
+  },
+
+  /**
+   * Normalize and keep every formula inside the grabbed article.
+   *
+   * Three input shapes are supported:
+   *  - native MathML (<math>…</math>), optionally wrapped in a KaTeX
+   *    `.katex` two-layer marker (a MathML layer plus an aria-hidden visual
+   *    copy);
+   *  - MathJax TeX scripts, which _replaceMathTexScripts() has already turned
+   *    into inert <code>/<pre data-readability-math="tex"> elements.
+   *
+   * Only formulas that survived the candidate selection are processed; nothing
+   * is restored from parts of the document that were dropped. Each resulting
+   * formula keeps its original position and its inline/block semantics, gets a
+   * single representative text stashed in `_readabilityMathText`, and is
+   * tagged with the data-readability-math attribute so _getMathAwareTextContent
+   * can count it exactly once.
+   *
+   * @param Element articleContent
+   * @return void
+   **/
+  _processMathInContent(articleContent) {
+    // 1. KaTeX markers keep the MathML layer only; the visual HTML copy and
+    //    any other annotation/error layers are discarded.
+    this._forEachNode(
+      this._getAllNodesWithTag(articleContent, ["span"]),
+      function (span) {
+        if (
+          span.tagName === "SPAN" &&
+          (span.className || "").split(/\s+/).includes("katex")
+        ) {
+          this._flattenKatex(span);
+        }
+      }
+    );
+
+    // 2. Normalize every remaining MathML element and stash its text once.
+    this._forEachNode(
+      this._getAllNodesWithTag(articleContent, ["math"]),
+      function (math) {
+        this._normalizeMathML(math);
+      }
+    );
+
+    // 3. Compute the single representative text for the inert TeX elements
+    //    produced from MathJax scripts. MathML texts were computed in step 2.
+    this._forEachNode(
+      this._getAllNodesWithTag(articleContent, ["code", "pre"]),
+      function (node) {
+        if (node.getAttribute(this.MATH_MARKER_ATTR) === "tex") {
+          node._readabilityMathText = node.textContent;
+        }
+      }
+    );
+  },
+
+  /**
+   * Replace a KaTeX `.katex` wrapper with its MathML layer.
+   *
+   * KaTeX renders two parallel layers: an accessible MathML tree
+   * (`.katex-mathml`, which itself contains the <math>) and a visual HTML
+   * approximation (`.katex-html`, aria-hidden="true"). We keep the MathML
+   * element and drop the wrapper, the visual copy and everything else, so the
+   * formula is represented exactly once. If no MathML layer exists, leave the
+   * wrapper untouched so content is never silently destroyed.
+   *
+   * @param Element katexSpan the element carrying the `katex` class
+   * @return void
+   **/
+  _flattenKatex(katexSpan) {
+    var mathElements = katexSpan.getElementsByTagName("math");
+    var math = mathElements[0] || null;
+    if (!math) {
+      return;
+    }
+
+    var classes = (katexSpan.className || "").split(/\s+/);
+    var display =
+      math.getAttribute("display") === "block" ||
+      classes.includes("katex-display");
+    if (display) {
+      math.setAttribute("display", "block");
+    }
+
+    katexSpan.parentNode.replaceChild(math, katexSpan);
+  },
+
+  /**
+   * Reduce a <math> element to its meaningful display branch, record whether
+   * it is displayed as a block, and stash the single text it should contribute
+   * to articleContent.textContent.
+   *
+   * Text precedence, per formula:
+   *   1. a TeX source comment inside the MathML;
+   *   2. the alttext attribute;
+   *   3. the text of the MathML display branch;
+   *   4. the raw TeX carried by an application/x-tex annotation, only when the
+   *      display branch itself has no text.
+   *
+   * Annotation elements are removed from the kept tree: non-TeX annotations
+   * carry no display semantics, while the TeX annotation is a source duplicate
+   * of the display branch. Removing it guarantees the formula contributes its
+   * text exactly once to textContent; its raw TeX is captured first so it can
+   * still be used as the last-resort representative text. The <semantics>
+   * wrapper and every other MathML rendering element are left in place.
+   *
+   * @param Element math
+   * @return void
+   **/
+  _normalizeMathML(math) {
+    var display = math.getAttribute("display") === "block";
+
+    // TeX source comments, e.g. <!-- x = 1 --> used by some MathJax setups.
+    var commentTex = this._findMathComment(math);
+
+    // Capture TeX annotations before pruning, since the annotations themselves
+    // are dropped from the kept MathML tree. TeX may live in either <annotation>
+    // or <annotation-xml>.
+    var annotationTex = "";
+    var annotationElements = math.getElementsByTagName("*");
+    this._forEachNode(annotationElements, function (element) {
+      if (
+        element.localName !== "annotation" &&
+        element.localName !== "annotation-xml"
+      ) {
+        return;
+      }
+      var encoding = (element.getAttribute("encoding") || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, "");
+      if (
+        !annotationTex &&
+        (encoding === "application/x-tex" || encoding === "tex") &&
+        element.textContent.trim()
+      ) {
+        annotationTex = element.textContent;
+      }
+    });
+
+    this._pruneMathAnnotations(math);
+
+    if (display) {
+      math.setAttribute("display", "block");
+    } else {
+      math.removeAttribute("display");
+    }
+    math.setAttribute(this.MATH_MARKER_ATTR, "mathml");
+
+    var alttext = math.getAttribute("alttext");
+    var displayText = math.textContent.trim();
+
+    var mathText =
+      commentTex || (alttext && alttext.trim()) || displayText || annotationTex;
+    math._readabilityMathText = mathText;
+  },
+
+  /**
+   * Return the text of the first comment node inside a MathML element whose
+   * content looks like TeX source (non-empty after trimming). Comments are not
+   * exposed through textContent, so this is the only way such TeX can survive.
+   *
+   * @param Element math
+   * @return string empty string when no suitable comment exists
+   **/
+  _findMathComment(math) {
+    var comment = null;
+    var walk = function (node) {
+      for (var i = 0; i < node.childNodes.length; i++) {
+        var child = node.childNodes[i];
+        if (child.nodeType === 8) {
+          comment = child;
+          return;
+        }
+        if (child.nodeType === 1) {
+          walk(child);
+        }
+      }
+    };
+    walk(math);
+    return comment ? comment.textContent.trim() : "";
+  },
+
+  /**
+   * Remove every <annotation>/<annotation-xml> element inside a MathML tree.
+   *
+   * Only <semantics> annotations are pruned: they carry source duplicates
+   * (e.g. TeX) or alternative encodings rather than the rendered formula, so
+   * removing them makes each formula contribute its display text exactly once
+   * to textContent. Every other MathML element - including presentational
+   * wrappers such as mstyle, merror, mpadded and mphantom, which carry real
+   * rendering semantics - is left untouched. The TeX source has already been
+   * captured by _normalizeMathML before this runs.
+   *
+   * @param Element math
+   * @return void
+   **/
+  _pruneMathAnnotations(math) {
+    var elements = Array.prototype.slice.call(math.getElementsByTagName("*"));
+    elements.forEach(element => {
+      if (
+        element.localName === "annotation" ||
+        element.localName === "annotation-xml"
+      ) {
+        element.remove();
+      }
+    });
+  },
+
+  /**
+   * Compute the text content of the article while counting every formula
+   * exactly once, using the representative text stashed by
+   * _normalizeMathML / _replaceMathTexScripts.
+   *
+   * Elements tagged data-readability-math are treated as atomic: their own
+   * (possibly duplicated, e.g. annotation) text is ignored and the stashed
+   * representative is emitted once. Nested math elements are therefore skipped
+   * automatically. Every other node contributes its text nodes as usual, so
+   * the result differs from a plain element.textContent only inside formulas.
+   *
+   * @param Element root
+   * @return string
+   **/
+  _getMathAwareTextContent(root) {
+    var parts = [];
+    var walk = node => {
+      if (
+        node.nodeType === 1 &&
+        node.hasAttribute &&
+        node.hasAttribute(this.MATH_MARKER_ATTR)
+      ) {
+        parts.push(node._readabilityMathText || "");
+        return;
+      }
+      if (node.nodeType === 3) {
+        parts.push(node.textContent);
+        return;
+      }
+      var children = node.childNodes || [];
+      for (var i = 0; i < children.length; i++) {
+        walk(children[i]);
+      }
+    };
+    walk(root);
+    return parts.join("");
   },
 
   /**
@@ -1996,10 +2256,59 @@ Readability.prototype = {
   /**
    * Removes script tags from the document.
    *
+   * When preserveMath is enabled, MathJax TeX <script> tags
+   * (type="math/tex" and type="math/tex; mode=display") are first converted
+   * into inert elements carrying the raw TeX as text. Every other script -
+   * including any that fail to parse as math - is still removed, so no script
+   * can execute and no rendering service is ever requested. The conversion has
+   * to happen before the generic script removal (and therefore before the
+   * candidate-grab innerHTML cache is taken) so the formulas survive the
+   * grabArticle retry attempts.
+   *
    * @param Element
    **/
   _removeScripts(doc) {
+    if (this._preserveMath) {
+      this._replaceMathTexScripts(doc);
+    }
     this._removeNodes(this._getAllNodesWithTag(doc, ["script", "noscript"]));
+  },
+
+  /**
+   * Replace every MathJax TeX <script> under `doc` with an inert element:
+   *   <code data-readability-math="tex">…raw TeX…</code> for inline math,
+   *   <pre  data-readability-math="tex">…raw TeX…</pre> for display math.
+   * The original TeX is preserved verbatim as a text node; the replacement
+   * elements have no scripting behaviour whatsoever.
+   *
+   * The type is parsed as a MIME type so that whitespace, casing and
+   * parameter order do not matter: any "math/tex" script qualifies, and only
+   * an explicit "mode=display" parameter makes it a block-level formula.
+   *
+   * @param Element
+   * @return void
+   **/
+  _replaceMathTexScripts(doc) {
+    var scripts = this._getAllNodesWithTag(doc, ["script"]);
+    this._forEachNode(scripts, function (script) {
+      var rawType = (script.getAttribute("type") || "")
+        .trim()
+        .toLowerCase()
+        .replace(/\s+/g, " ");
+      var semi = rawType.indexOf(";");
+      var mimeType = (semi === -1 ? rawType : rawType.slice(0, semi)).trim();
+      if (mimeType !== this.MATH_TEX_INLINE_TYPE) {
+        return;
+      }
+
+      var params = semi === -1 ? "" : rawType.slice(semi + 1);
+      var isDisplay = /(?:^|;)\s*mode\s*=\s*display\s*(?:;|$)/.test(params);
+
+      var replacement = doc.createElement(isDisplay ? "pre" : "code");
+      replacement.setAttribute(this.MATH_MARKER_ATTR, "tex");
+      replacement.textContent = script.textContent;
+      script.parentNode.replaceChild(replacement, script);
+    });
   },
 
   /**
@@ -2789,7 +3098,9 @@ Readability.prototype = {
       }
     }
 
-    var textContent = articleContent.textContent;
+    var textContent = this._preserveMath
+      ? this._getMathAwareTextContent(articleContent)
+      : articleContent.textContent;
     return {
       title: this._articleTitle,
       byline: metadata.byline || this._articleByline,

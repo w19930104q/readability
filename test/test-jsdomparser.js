@@ -449,12 +449,12 @@ describe("Test HTML escaping", function () {
   it("should handle updates via textContent correctly", function () {
     // Because the initial tests might be based on cached innerHTML values,
     // let's manipulate via textContent in order to test that it alters
-    // the innerHTML correctly.
+    // the innerHTML correctly. Quotes must be escaped just like &, < and >
+    // so the serialized text round-trips through an HTML parser.
     txtNode.textContent = txtNode.textContent + " ";
     txtNode.textContent = txtNode.textContent.trim();
-    var expectedHTML = baseStr.replace("&quot;", '"').replace("&apos;", "'");
-    expect("<p>" + txtNode.innerHTML + "</p>").eql(expectedHTML);
-    expect("<p>" + p.innerHTML + "</p>").eql(expectedHTML);
+    expect("<p>" + txtNode.innerHTML + "</p>").eql(baseStr);
+    expect("<p>" + p.innerHTML + "</p>").eql(baseStr);
   });
 
   it("should handle decimal and hex escape sequences", function () {
