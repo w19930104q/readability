@@ -64,6 +64,7 @@ function Readability(doc, options) {
   this._disableJSONLD = !!options.disableJSONLD;
   this._allowedVideoRegex = options.allowedVideoRegex || this.REGEXPS.videos;
   this._linkDensityModifier = options.linkDensityModifier || 0;
+  this._keepFootnotes = !!options.keepFootnotes;
 
   // Start with all flags set
   this._flags =
@@ -185,6 +186,13 @@ Readability.prototype = {
     "dialog",
   ],
 
+  // ARIA roles and data-type values used by EPUB-style footnotes.
+  // See https://www.w3.org/TR/dpub-aria-1.0/
+  FOOTNOTE_REFERENCE_ROLES: ["doc-noteref"],
+  FOOTNOTE_REFERENCE_DATA_TYPES: ["noteref"],
+  FOOTNOTE_TARGET_ROLES: ["doc-footnote", "doc-endnote"],
+  FOOTNOTE_TARGET_DATA_TYPES: ["footnote"],
+
   DIV_TO_P_ELEMS: new Set([
     "BLOCKQUOTE",
     "DL",
@@ -282,6 +290,15 @@ Readability.prototype = {
   _postProcessContent(articleContent) {
     // Readability cannot open relative uris so we convert them to absolute uris.
     this._fixRelativeUris(articleContent);
+
+    // Footnote targets (often inside <aside> elements) can be stripped
+    // during grabbing/cleaning. Re-attach the ones still referenced by
+    // footnote reference links in the final content. Runs after relative
+    // URIs are fixed so cross-page references (e.g. those produced by a
+    // <base> element) can be recognized and ignored.
+    if (this._keepFootnotes) {
+      this._restoreFootnotes(articleContent);
+    }
 
     this._simplifyNestedElements(articleContent);
 
@@ -430,6 +447,342 @@ Readability.prototype = {
 
     for (node = node.firstElementChild; node; node = node.nextElementSibling) {
       this._cleanClasses(node);
+    }
+  },
+
+  /**
+   * Tests whether an element is a footnote reference link, i.e. an <a>
+   * carrying role="doc-noteref" or data-type="noteref".
+   *
+   * @param Element node
+   * @return boolean
+   */
+  _isFootnoteReference(node) {
+    if (!node || node.tagName !== "A") {
+      return false;
+    }
+    var role = node.getAttribute("role");
+    var dataType = node.getAttribute("data-type");
+    return (
+      (role && this.FOOTNOTE_REFERENCE_ROLES.includes(role)) ||
+      (dataType && this.FOOTNOTE_REFERENCE_DATA_TYPES.includes(dataType))
+    );
+  },
+
+  /**
+   * Tests whether an element is a footnote target, i.e. an element
+   * carrying role="doc-footnote"/"doc-endnote" or data-type="footnote".
+   *
+   * @param Element node
+   * @return boolean
+   */
+  _isFootnoteTarget(node) {
+    if (!node || node.nodeType !== this.ELEMENT_NODE) {
+      return false;
+    }
+    var role = node.getAttribute("role");
+    var dataType = node.getAttribute("data-type");
+    return (
+      (role && this.FOOTNOTE_TARGET_ROLES.includes(role)) ||
+      (dataType && this.FOOTNOTE_TARGET_DATA_TYPES.includes(dataType))
+    );
+  },
+
+  /**
+   * Tests whether `ancestor` is an ancestor of (or equal to) `node`.
+   * Walks parentNode chains manually so this works with DOM
+   * implementations that lack Node.prototype.contains (e.g. JSDOMParser).
+   *
+   * @param Node ancestor
+   * @param Node node
+   * @return boolean
+   */
+  _isAncestorOrSelf(ancestor, node) {
+    while (node) {
+      if (node === ancestor) {
+        return true;
+      }
+      node = node.parentNode;
+    }
+    return false;
+  },
+
+  /**
+   * Tests whether a link href points at a fragment inside the current
+   * document. Links that target another page (including same-document
+   * relative links rewritten against a <base> element) are ignored,
+   * since external pages are never fetched.
+   *
+   * Must run after _fixRelativeUris has normalized hrefs.
+   *
+   * @param String href The (already absolutized) href attribute.
+   * @return boolean
+   */
+  _isSameDocumentHashLink(href) {
+    if (!href || href.charAt(0) !== "#") {
+      return false;
+    }
+    // An empty or missing fragment cannot identify a target.
+    return href.length > 1;
+  },
+
+  /**
+   * Deep-clones an element, including its attributes and descendants.
+   *
+   * Element.cloneNode is not implemented by the bundled JSDOMParser, so
+   * this builds a fresh element through createElement and round-trips its
+   * descendants via innerHTML, which both supported DOM implementations
+   * serialize and parse. Clones keep footnote snapshots independent of the
+   * live nodes that the regular cleaning removes or hollows out.
+   *
+   * @param Element node The element to clone.
+   * @return Element A detached, independent copy of the element.
+   */
+  _cloneElement(node) {
+    var clone = this._doc.createElement(node.tagName);
+    for (var i = 0; i < node.attributes.length; i++) {
+      var attr = node.attributes[i];
+      clone.setAttribute(attr.name, attr.value);
+    }
+    // eslint-disable-next-line no-unsanitized/property
+    clone.innerHTML = node.innerHTML;
+    return clone;
+  },
+
+  /**
+   * Walks the document and records every footnote target element, keyed
+   * by its id. Footnote targets (often inside <aside> elements) may be
+   * stripped during the regular grabbing/cleaning process; this snapshot
+   * lets _restoreFootnotes move them back later.
+   *
+   * Each entry keeps both the live node and an independent deep clone.
+   * The live node tells _restoreFootnotes whether the regular extraction
+   * already retained the target (in which case it is not duplicated); the
+   * clone preserves the full original subtree even when the live node is
+   * removed or has its descendants/attributes stripped while cleaning.
+   *
+   * Called once before grabbing starts and again whenever _grabArticle
+   * resets page.innerHTML between retries (which rebuilds the DOM). On a
+   * refresh, entries from earlier passes are kept as long as their ids
+   * remain unambiguous, so targets detached by the regular cleaning can
+   * still be restored.
+   *
+   * A duplicated id makes the reference ambiguous, so such targets are
+   * skipped with a diagnostic rather than guessing which one to use.
+   *
+   * @return void
+   */
+  _collectFootnoteTargets() {
+    var previousById = this._footnoteTargetsById;
+    var previousDuplicates = this._duplicateFootnoteTargetIds;
+    var targetsById = new Map();
+    var duplicateIds = new Set();
+
+    var elements = this._doc.getElementsByTagName("*");
+    this._forEachNode(elements, node => {
+      if (!this._isFootnoteTarget(node)) {
+        return;
+      }
+      var id = node.getAttribute("id");
+      if (!id) {
+        this.log(
+          "Footnote target without id cannot be referenced; skipping:",
+          node
+        );
+        return;
+      }
+      if (duplicateIds.has(id)) {
+        this.log(
+          "Duplicate footnote target id '" + id + "'; skipping target:",
+          node
+        );
+        return;
+      }
+      if (targetsById.has(id)) {
+        // The id is ambiguous: never guess which element a reference points at.
+        this.log(
+          "Duplicate footnote target id '" +
+            id +
+            "'; discarding all targets with this id"
+        );
+        targetsById.delete(id);
+        duplicateIds.add(id);
+        return;
+      }
+      // contentNode tracks where the target's real content lives. If the
+      // wrapper is discarded but its content is moved into the article
+      // (a single-<p> div unwrapped into a paragraph, or a text-only
+      // target converted to another tag), the recorded child is what
+      // survives; element and text children are both followed.
+      var contentNode = node.firstElementChild;
+      if (!contentNode) {
+        contentNode = this._findNode(node.childNodes, child => {
+          return (
+            child.nodeType === this.ELEMENT_NODE || !this._isWhitespace(child)
+          );
+        });
+      }
+      targetsById.set(id, {
+        liveNode: node,
+        contentNode: contentNode || node,
+        clone: this._cloneElement(node),
+      });
+    });
+
+    if (previousById) {
+      // Preserve entries captured before a DOM reset/retry, provided the
+      // id is not (and never was) ambiguous and is not provided by a fresh
+      // in-document target. These typically correspond to nodes detached
+      // while the previous pass cleaned the article (e.g. <aside> notes).
+      previousById.forEach((entry, id) => {
+        if (duplicateIds.has(id) || targetsById.has(id)) {
+          return;
+        }
+        if (previousDuplicates && previousDuplicates.has(id)) {
+          duplicateIds.add(id);
+          return;
+        }
+        targetsById.set(id, entry);
+      });
+      previousDuplicates.forEach(id => {
+        duplicateIds.add(id);
+      });
+    }
+
+    this._footnoteTargetsById = targetsById;
+    this._duplicateFootnoteTargetIds = duplicateIds;
+  },
+
+  /**
+   * Re-attaches footnote targets that were stripped out of the article
+   * (typically <aside> footnotes) but are still referenced by
+   * doc-noteref/noteref links in the final content.
+   *
+   * Targets are appended in the order in which their references first
+   * appear; each target is attached at most once. References nested
+   * inside an appended footnote are followed recursively, with cycles
+   * broken by the seen-id set. Cross-page links are ignored and missing
+   * or duplicated ids produce diagnostics instead of guessed targets.
+   *
+   * @param Element articleContent The finalized article element.
+   * @return void
+   */
+  _restoreFootnotes(articleContent) {
+    if (!this._footnoteTargetsById || !this._footnoteTargetsById.size) {
+      return;
+    }
+
+    // _grabArticle wraps the selected content in a #readability-page-1
+    // element (the serializer outputs that inner element's innerHTML).
+    // Append footnotes to that content root so they end up in the output.
+    var contentRoot = articleContent;
+    var pageElement = this._findNode(articleContent.children, child => {
+      return child.id === "readability-page-1";
+    });
+    if (pageElement) {
+      contentRoot = pageElement;
+    }
+
+    var appendedIds = new Set();
+    // Worklist of ids to resolve; preserves first-reference ordering and
+    // supports references discovered inside appended footnotes.
+    var pendingIds = [];
+    var queuedIds = new Set();
+
+    var queueId = id => {
+      if (!appendedIds.has(id) && !queuedIds.has(id)) {
+        queuedIds.add(id);
+        pendingIds.push(id);
+      }
+    };
+
+    var collectReferences = root => {
+      var links = this._getAllNodesWithTag(root, ["a"]);
+      this._forEachNode(links, link => {
+        if (!this._isFootnoteReference(link)) {
+          return;
+        }
+        var href = link.getAttribute("href");
+        if (!href) {
+          this.log("Footnote reference without href cannot be resolved:", link);
+          return;
+        }
+        if (href === "#") {
+          this.log(
+            "Footnote reference has an empty fragment and cannot be resolved:",
+            link
+          );
+          return;
+        }
+        if (!this._isSameDocumentHashLink(href)) {
+          this.log(
+            "Ignoring footnote reference to another document (" +
+              href +
+              "); external pages are not fetched:",
+            link
+          );
+          return;
+        }
+        queueId(href.substring(1));
+      });
+    };
+
+    collectReferences(contentRoot);
+
+    while (pendingIds.length) {
+      var id = pendingIds.shift();
+      queuedIds.delete(id);
+
+      if (appendedIds.has(id)) {
+        // Cyclic or repeated reference: the target is already present.
+        continue;
+      }
+
+      if (this._duplicateFootnoteTargetIds.has(id)) {
+        this.log(
+          "Footnote reference '" +
+            id +
+            "' is ambiguous because multiple targets share this id; skipping"
+        );
+        continue;
+      }
+
+      var entry = this._footnoteTargetsById.get(id);
+      if (!entry) {
+        // No matching footnote target in this document; do not guess.
+        this.log(
+          "Footnote reference '" +
+            id +
+            "' does not match any footnote target in this document; skipping"
+        );
+        continue;
+      }
+
+      if (
+        this._isAncestorOrSelf(contentRoot, entry.liveNode) ||
+        this._isAncestorOrSelf(contentRoot, entry.contentNode)
+      ) {
+        // The regular extraction retained the target, or unwrapped its
+        // content into the article (e.g. a single-<p> div converted to a
+        // paragraph, or a text-only target converted to another tag).
+        // Never duplicate content that is already part of the article.
+        this.log(
+          "Footnote target '" +
+            id +
+            "' is already part of the article; keeping it"
+        );
+        appendedIds.add(id);
+        continue;
+      }
+
+      this.log("Restoring stripped footnote target '" + id + "'");
+      // Append the preserved clone, never the live node: the live node may
+      // have been hollowed out or detached during the regular cleaning.
+      contentRoot.appendChild(entry.clone);
+      appendedIds.add(id);
+
+      // Follow references nested inside the restored footnote, recursively.
+      collectReferences(entry.clone);
     }
   },
 
@@ -1052,6 +1405,14 @@ Readability.prototype = {
 
     var pageCacheHtml = page.innerHTML;
 
+    // Snapshot footnote targets before this pass removes or hollows out
+    // anything (e.g. <aside> blocks), so the full target subtrees remain
+    // available for _restoreFootnotes. The snapshot never feeds back into
+    // the selection logic below.
+    if (this._keepFootnotes) {
+      this._collectFootnoteTargets();
+    }
+
     while (true) {
       this.log("Starting grabArticle loop");
       var stripUnlikelyCandidates = this._flagIsActive(
@@ -1573,6 +1934,13 @@ Readability.prototype = {
         parseSuccessful = false;
         // eslint-disable-next-line no-unsanitized/property
         page.innerHTML = pageCacheHtml;
+
+        // Resetting innerHTML rebuilds the page DOM, orphaning any nodes
+        // captured before the retry. Re-snapshot footnote targets so the
+        // final pass can still restore them.
+        if (this._keepFootnotes) {
+          this._collectFootnoteTargets();
+        }
 
         this._attempts.push({
           articleContent,

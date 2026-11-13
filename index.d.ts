@@ -75,6 +75,16 @@ export interface ReadabilityOptions<T = string> {
    * Defaults to 1.
    */
   linkDensityModifier?: number;
+  /**
+   * If `true`, Readability restores footnote/endnote targets (elements
+   * with `role="doc-footnote"`, `role="doc-endnote"` or
+   * `data-type="footnote"`) that were removed while extracting the
+   * article but are still referenced by `role="doc-noteref"` /
+   * `data-type="noteref"` links in the final content. Targets are
+   * appended in the order of their first reference, each at most once;
+   * cross-page references are ignored. Defaults to `false`.
+   */
+  keepFootnotes?: boolean;
 }
 
 export class Readability<T = string> {
